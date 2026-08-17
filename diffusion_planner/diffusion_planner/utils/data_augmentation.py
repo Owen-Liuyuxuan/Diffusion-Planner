@@ -660,6 +660,8 @@ class StatePerturbationAtTau(StatePerturbation):
           is re-derived from ω and the new speed, matching parent ``augment``).
     - Quintic bridge on each side of τ over ``num_refine * time_interval`` so
       pose **and** speed/steer recover continuously toward GT at the bridge ends.
+    - Apply the optional history-speed scale before building either bridge,
+      anchored at the current pose rather than at the global origin.
     - Re-derive ``ego_current_state`` at t=0 from the rewritten trajectory.
     - Collision check + centric transform (with ego-past transform enabled).
     """
@@ -686,7 +688,7 @@ class StatePerturbationAtTau(StatePerturbation):
         self._tau_min_s = float(tau_min_s)
         self._tau_max_s = float(tau_max_s)
         self._transform_ego_past = True
-        # Past is already rewritten by the bridges; default noise scale off.
+        # Unlike the parent path, this scale is applied before the tau bridges are built.
         self._ego_past_noise_std = float(ego_past_noise_std)
         # Last successful sample metadata for visualization / debugging.
         self.last_tau_info: dict | None = None
@@ -703,22 +705,33 @@ class StatePerturbationAtTau(StatePerturbation):
         inputs["ego_agent_past"][aug_flag] = aug_past[aug_flag]
         ego_future[aug_flag] = aug_future[aug_flag]
 
-        # Optional residual past scale (off by default for this subclass).
-        B_aug = aug_flag.sum().item()
-        if B_aug > 0 and self._ego_past_noise_std > 0.0:
-            W = self._ego_past_noise_std
-            scale = torch.normal(mean=1.0, std=W, size=(B_aug, 1, 1)).to(
-                inputs["ego_agent_past"].device
-            )
-            scale = torch.clamp(scale, 1.0 - 2 * W, 1.0 + 2 * W)
-            ego_past_aug = inputs["ego_agent_past"][aug_flag].clone()
-            ego_past_aug[..., :2] = ego_past_aug[..., :2] * scale
-            inputs["ego_agent_past"][aug_flag] = ego_past_aug
-            scale_1d = scale.squeeze(-1)
-            inputs["ego_current_state"][aug_flag, 4:6] *= scale_1d
-            inputs["ego_current_state"][aug_flag, 6:8] *= scale_1d
-
         return self.centric_transform(inputs, ego_future, neighbors_future)
+
+    @staticmethod
+    def _scale_history_about_current(
+        ego_current: torch.Tensor,
+        ego_past: torch.Tensor,
+        aug_flag: torch.Tensor,
+        scale_by_batch: torch.Tensor,
+    ) -> None:
+        """Dilate accepted histories about their current pose, in place.
+
+        ``ego_past`` and ``ego_current`` are still in the same pre-centric frame here.
+        Anchoring the dilation at the current position preserves
+        ``ego_past[-1].xy == ego_current.xy`` even when that position is not the origin.
+        The matching velocity/acceleration scale is consumed by the tau bridge as a
+        boundary condition rather than being applied after the future was constructed.
+        """
+        if not bool(aug_flag.any().item()):
+            return
+
+        scale_xy = scale_by_batch[aug_flag].reshape(-1, 1, 1)
+        center_xy = ego_current[aug_flag, :2].unsqueeze(1)
+        past_xy = ego_past[aug_flag, :, :2]
+        ego_past[aug_flag, :, :2] = center_xy + (past_xy - center_xy) * scale_xy
+
+        scale_state = scale_by_batch[aug_flag].reshape(-1, 1)
+        ego_current[aug_flag, 4:8] *= scale_state
 
     def augment_at_tau(self, inputs, ego_future):
         """Rewrite past/current/future around a random τ; return aug tensors + flag."""
@@ -737,6 +750,28 @@ class StatePerturbationAtTau(StatePerturbation):
         valid_speed = torch.abs(ego_current[:, 4]) >= 2.0
         aug_flag = (torch.rand(B, device=device) < self._augment_prob) & valid_speed
 
+        # Apply the independent history-speed augmentation before constructing the
+        # two tau bridges. Scaling about ego_current.xy is equivalent to re-centering
+        # first, scaling in the centered frame, and transforming back; unlike scaling
+        # about (0, 0), it also preserves the history/current join for nonzero poses.
+        history_scale = torch.ones(B, device=device, dtype=dtype)
+        B_aug = int(aug_flag.sum().item())
+        if B_aug > 0 and self._ego_past_noise_std > 0.0:
+            W = self._ego_past_noise_std
+            sampled_scale = torch.normal(
+                mean=1.0,
+                std=W,
+                size=(B_aug,),
+                device=device,
+            ).to(dtype=dtype)
+            history_scale[aug_flag] = torch.clamp(sampled_scale, 1.0 - 2 * W, 1.0 + 2 * W)
+            self._scale_history_about_current(
+                ego_current=ego_current,
+                ego_past=ego_past,
+                aug_flag=aug_flag,
+                scale_by_batch=history_scale,
+            )
+
         for batch_index in torch.nonzero(aug_flag, as_tuple=False).flatten():
             b = int(batch_index.item())
             try:
@@ -752,6 +787,7 @@ class StatePerturbationAtTau(StatePerturbation):
                     dt=dt,
                     device=device,
                     dtype=dtype,
+                    history_scale=float(history_scale[b].item()),
                 )
             except (RuntimeError, ValueError):
                 ok = False
@@ -781,6 +817,7 @@ class StatePerturbationAtTau(StatePerturbation):
         dt: float,
         device,
         dtype,
+        history_scale: float = 1.0,
     ) -> bool:
         """In-place rewrite one sample. Returns False if the window is infeasible."""
         b = batch_index
@@ -953,6 +990,7 @@ class StatePerturbationAtTau(StatePerturbation):
             "psi_gt_rad": psi_gt_val,
             "psi_tau_rad": psi_tau_val,
             "refine_horizon_s": float(self.refine_horizon_s),
+            "history_scale": history_scale,
         }
         return True
 
