@@ -58,7 +58,11 @@ from diffusion_planner.utils.data_augmentation import (
     _rect_corners,
     _sat_signed_distance,
     _segments_intersect_rect,
+    heading_from_cos_sin,
     heading_transform,
+    project_onto_heading,
+    rotate_xy_by_heading,
+    tangential_va,
     vector_transform,
 )
 
@@ -202,8 +206,10 @@ def test_heading_transform_identity():
     I = torch.eye(2).unsqueeze(0).expand(B, -1, -1).clone()
     out = heading_transform(h, I)
     assert out.shape == h.shape
-    assert torch.allclose(out, h, atol=1e-5), (
-        f"Identity heading transform changed values (max diff {(out - h).abs().max():.2e})"
+    # atan2 wraps to (-pi, pi]; identity rotation still canonicalizes the angle.
+    wrapped = torch.atan2(torch.sin(h), torch.cos(h))
+    assert torch.allclose(out, wrapped, atol=1e-5), (
+        f"Identity heading transform changed values (max diff {(out - wrapped).abs().max():.2e})"
     )
     print("  [PASS] heading_transform identity")
 
@@ -434,6 +440,100 @@ def test_interpolation_endpoint_proximity():
     # Allow up to one full timestep of travel at vx=5 m/s (= 0.5 m) plus margin
     assert err <= 0.5 + 1e-4, f"Interpolation end-point error too large: {err:.4f} m"
     print("  [PASS] interpolation end-point proximity")
+
+
+def test_tangential_va_keeps_braking_sign():
+    heading = torch.zeros(2)
+    velocity = torch.tensor([[8.0, 0.0], [8.0, 0.0]])
+    accel = torch.tensor([[-2.0, 0.0], [1.5, 0.0]])
+    v, a = tangential_va(velocity, accel, heading)
+    assert torch.allclose(v, torch.tensor([8.0, 8.0]), atol=1e-6)
+    assert torch.allclose(a, torch.tensor([-2.0, 1.5]), atol=1e-6)
+    print("  [PASS] tangential_va braking sign")
+
+
+def test_tangential_va_constant_speed_turn_drops_centripetal():
+    """ay = v*omega is centripetal; tangential a must be 0, not ||(ax, ay)||."""
+    v = 8.0
+    kappa = 0.06
+    omega = v * kappa
+    heading = torch.zeros(1)
+    velocity = torch.tensor([[v, 0.0]])
+    accel = torch.tensor([[0.0, v * omega]])
+    tan_v, tan_a = tangential_va(velocity, accel, heading)
+    assert torch.allclose(tan_v, torch.tensor([v]), atol=1e-5)
+    assert torch.allclose(tan_a, torch.zeros(1), atol=1e-5)
+    assert torch.linalg.norm(accel[0]).item() > 3.0  # the old torch.norm value
+    print("  [PASS] tangential_va drops centripetal")
+
+
+def test_project_onto_heading_rotated_frame():
+    heading = torch.tensor([math.pi / 2])
+    xy = torch.tensor([[0.0, 5.0]])  # +y is forward at heading pi/2
+    assert torch.allclose(project_onto_heading(xy, heading), torch.tensor([5.0]), atol=1e-5)
+    assert torch.allclose(
+        heading_from_cos_sin(torch.tensor([0.0]), torch.tensor([1.0])),
+        torch.tensor([math.pi / 2]),
+        atol=1e-5,
+    )
+    print("  [PASS] project_onto_heading rotated frame")
+
+
+def test_rotate_then_inverse_preserves_body_velocity():
+    """Pre-rotate by +heading, then centric R(-heading), recovers body-frame v."""
+    aug = _make_aug()
+    heading = 0.2
+    state = _ego_state(1, heading=heading, vx=8.0)
+    body_v = state[:, 4:6].clone()
+    rotated = rotate_xy_by_heading(body_v, state[:, 2], state[:, 3])
+    mat = aug.get_transform_matrix_batch(state)
+    recovered = vector_transform(rotated.unsqueeze(1), mat).squeeze(1)
+    assert torch.allclose(recovered, body_v, atol=1e-5), recovered
+    print("  [PASS] rotate then inverse preserves body velocity")
+
+
+def test_interpolation_zero_perturbation_braking_nearly_identity():
+    """Constant-accel braking GT must not be rewritten as a speed-up (old norm bug)."""
+    aug = _make_aug()
+    dt = aug.time_interval
+    p = aug.num_refine
+    v0, a0 = 8.0, -2.0
+    t_fut = 80
+    times = torch.arange(1, t_fut + 1, dtype=torch.float32) * dt
+    ego_future = torch.zeros(1, t_fut, 3)
+    ego_future[0, :, 0] = v0 * times + 0.5 * a0 * times**2
+    state = _ego_state(1, vx=v0)
+    state[0, 6] = a0
+    out = aug.interpolation_future_trajectory(state, ego_future, keep_remaining=False)
+    gt = torch.stack([v0 * times[:p] + 0.5 * a0 * times[:p] ** 2, torch.zeros(p)], dim=-1)
+    err = (out[0, :, :2] - gt).norm(dim=-1).max().item()
+    assert err < 0.08, f"braking identity error {err:.3f} m (old bug ~0.55 m)"
+    print("  [PASS] interpolation braking identity")
+
+
+def test_interpolation_zero_perturbation_turn_nearly_identity():
+    """Constant-speed curve: centripetal must not be treated as tangential accel."""
+    aug = _make_aug()
+    dt = aug.time_interval
+    p = aug.num_refine
+    speed, kappa = 8.0, 0.06
+    omega = speed * kappa
+    radius = 1.0 / kappa
+    t_fut = 80
+    times = torch.arange(1, t_fut + 1, dtype=torch.float32) * dt
+    heading_t = omega * times
+    ego_future = torch.zeros(1, t_fut, 3)
+    ego_future[0, :, 0] = radius * torch.sin(heading_t)
+    ego_future[0, :, 1] = radius * (1.0 - torch.cos(heading_t))
+    ego_future[0, :, 2] = heading_t
+    state = _ego_state(1, vx=speed)
+    state[0, 7] = speed * omega  # ay centripetal
+    state[0, 9] = omega
+    out = aug.interpolation_future_trajectory(state, ego_future, keep_remaining=False)
+    gt = ego_future[0, :p, :2]
+    err = (out[0, :, :2] - gt).norm(dim=-1).max().item()
+    assert err < 0.12, f"turn identity error {err:.3f} m (old bug ~1.10 m)"
+    print("  [PASS] interpolation turn identity")
 
 
 # ─────────────────────────── centric_transform ──────────────────────────────

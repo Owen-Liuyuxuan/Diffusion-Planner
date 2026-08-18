@@ -38,6 +38,90 @@ def heading_transform(heading, transform_mat):
     ).reshape(*shape)
 
 
+def heading_from_cos_sin(cos_h: torch.Tensor, sin_h: torch.Tensor) -> torch.Tensor:
+    """Heading (rad) from a (cos, sin) pair. Broadcasts like ``torch.atan2``."""
+    return torch.atan2(sin_h, cos_h)
+
+
+def project_onto_heading(xy: torch.Tensor, heading: torch.Tensor) -> torch.Tensor:
+    """Signed projection of a 2-vector onto heading.
+
+    Args:
+        xy: (..., 2) velocity, acceleration, or finite-difference vector.
+        heading: (...) radians, broadcastable with ``xy`` without the last dim.
+
+    Returns:
+        (...) signed scalar along ``heading``. Positive is forward.
+    """
+    cos_h = torch.cos(heading)
+    sin_h = torch.sin(heading)
+    return xy[..., 0] * cos_h + xy[..., 1] * sin_h
+
+
+def tangential_va(
+    velocity_xy: torch.Tensor,
+    acceleration_xy: torch.Tensor,
+    heading: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Signed tangential speed and acceleration along ``heading``.
+
+    Unlike ``torch.norm``, this keeps the sign of braking and does not fold the
+    centripetal (lateral) component into longitudinal acceleration. The quintic
+    already accounts for centripetal acceleration via its ``v * omega`` terms.
+    """
+    return (
+        project_onto_heading(velocity_xy, heading),
+        project_onto_heading(acceleration_xy, heading),
+    )
+
+
+def polyline_tangential_va(
+    xy: torch.Tensor,
+    heading: torch.Tensor,
+    index: int,
+    dt: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Finite-difference velocity/acceleration at ``index``, projected on heading.
+
+    Matches ``interpolation_future_trajectory``: backward first/second differences
+    when two samples exist behind ``index``, otherwise forward differences.
+    """
+    n = int(xy.shape[0])
+    i = int(index)
+    zeros = xy.new_zeros(xy.shape[-1])
+    if n < 2:
+        heading_i = heading[i] if heading.ndim > 0 and heading.numel() > 1 else heading
+        return project_onto_heading(zeros, heading_i), project_onto_heading(zeros, heading_i)
+
+    if i >= 2:
+        vel_xy = (xy[i] - xy[i - 1]) / dt
+        acc_xy = (xy[i] - 2 * xy[i - 1] + xy[i - 2]) / dt**2
+    elif i <= 0:
+        vel_xy = (xy[1] - xy[0]) / dt
+        acc_xy = (xy[2] - 2 * xy[1] + xy[0]) / dt**2 if n >= 3 else zeros
+    else:
+        vel_xy = (xy[i] - xy[i - 1]) / dt
+        acc_xy = (xy[i + 1] - 2 * xy[i] + xy[i - 1]) / dt**2 if n >= 3 else zeros
+
+    heading_i = heading[i] if heading.ndim > 0 and heading.numel() > 1 else heading
+    return project_onto_heading(vel_xy, heading_i), project_onto_heading(acc_xy, heading_i)
+
+
+def rotate_xy_by_heading(
+    xy: torch.Tensor,
+    cos_h: torch.Tensor,
+    sin_h: torch.Tensor,
+) -> torch.Tensor:
+    """Rotate ``xy`` (..., 2) by heading ``(cos_h, sin_h)``.
+
+    Used to pre-rotate body-frame velocity/acceleration so ``centric_transform``'s
+    ``R(-heading)`` restores the original body-frame components (no sideslip).
+    """
+    lon = xy[..., 0]
+    lat = xy[..., 1]
+    return torch.stack([cos_h * lon - sin_h * lat, sin_h * lon + cos_h * lat], dim=-1)
+
+
 def _cross2d(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """2D cross product along the last dimension: u × v = u.x*v.y - u.y*v.x"""
     return u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
@@ -190,15 +274,9 @@ class StatePerturbation:
     def __call__(self, inputs, ego_future, neighbors_future):
         aug_flag, aug_ego_current_state = self.augment(inputs)
 
-        # Interpolate future trajectory
-        interpolated_ego_future = self.interpolation_future_trajectory(
-            aug_ego_current_state, ego_future
-        )
-
-        inputs["ego_current_state"][aug_flag] = aug_ego_current_state[aug_flag]
-        ego_future[aug_flag] = interpolated_ego_future[aug_flag]
-
-        # Scale past trajectory and current state velocity/acceleration
+        # Scale past and current v/a BEFORE interpolating the future. The quintic
+        # uses current velocity/acceleration as its start BC, so scaling afterwards
+        # left the state reporting a speed the target does not start with.
         B_aug = aug_flag.sum().item()
         if B_aug > 0:
             W = self._ego_past_noise_std
@@ -212,8 +290,15 @@ class StatePerturbation:
             inputs["ego_agent_past"][aug_flag] = ego_past_aug
 
             scale_1d = scale.squeeze(-1)  # (B_aug, 1)
-            inputs["ego_current_state"][aug_flag, 4:6] *= scale_1d  # vx, vy
-            inputs["ego_current_state"][aug_flag, 6:8] *= scale_1d  # ax, ay
+            aug_ego_current_state[aug_flag, 4:6] *= scale_1d  # vx, vy
+            aug_ego_current_state[aug_flag, 6:8] *= scale_1d  # ax, ay
+
+        interpolated_ego_future = self.interpolation_future_trajectory(
+            aug_ego_current_state, ego_future
+        )
+
+        inputs["ego_current_state"][aug_flag] = aug_ego_current_state[aug_flag]
+        ego_future[aug_flag] = interpolated_ego_future[aug_flag]
 
         return self.centric_transform(inputs, ego_future, neighbors_future)
 
@@ -263,6 +348,24 @@ class StatePerturbation:
 
         ego_current_state[:, 8] = steering_angle
         ego_current_state[:, 9] = new_yaw_rate
+
+        # ay is centripetal: vx * yaw_rate. Perturbing vx while carrying ay over
+        # breaks that by dvx * yaw_rate. Rebuild from the perturbed speed and keep
+        # the sampled ay noise on top (same treatment as steering_angle above).
+        ego_current_state[:, 7] = (
+            ego_current_state[:, 4] * new_yaw_rate + scaled_random_tensor[:, 6]
+        )
+
+        # Body-frame v/a would pick up sideslip after centric_transform rotates by
+        # R(-delta_heading). Pre-rotate by R(+heading) so the round trip is identity.
+        cos_h = ego_current_state[:, 2]
+        sin_h = ego_current_state[:, 3]
+        ego_current_state[:, 4:6] = rotate_xy_by_heading(
+            ego_current_state[:, 4:6], cos_h, sin_h
+        )
+        ego_current_state[:, 6:8] = rotate_xy_by_heading(
+            ego_current_state[:, 6:8], cos_h, sin_h
+        )
 
         # Discard augmentations that cause collisions
         collision = self._check_aug_validity(ego_current_state, inputs)
@@ -439,7 +542,10 @@ class StatePerturbation:
         inputs["ego_agent_future"] = ego_future
 
         # goal pose (x, y, cos, sin)
-        mask = torch.sum(torch.ne(inputs["goal_pose"], 0), dim=-1) == 0
+        # Validity is decided from the position only: heading_to_cos_sin turns an
+        # all-zero (x, y, heading) goal into (0, 0, 1, 0), so a full-width zero test
+        # never fires and an absent goal would survive as a goal at the ego itself.
+        mask = torch.sum(torch.ne(inputs["goal_pose"][..., :2], 0), dim=-1) == 0
         inputs["goal_pose"][..., :2] = vector_transform(
             inputs["goal_pose"][..., :2], transform_matrix, center_xy
         )
@@ -549,32 +655,28 @@ class StatePerturbation:
         M_t = self.t_matrix.unsqueeze(0).expand(B, -1, -1)
         A = self.coeff_matrix.unsqueeze(0).expand(B, -1, -1)
 
-        # state: [x, y, heading, velocity, acceleration, yaw_rate]
-
-        x0, y0, theta0, v0, a0, omega0 = (
-            aug_current_state[:, 0],
-            aug_current_state[:, 1],
-            torch.atan2(
-                (ego_future[:, int(P / 2), 1] - aug_current_state[:, 1]),
-                (ego_future[:, int(P / 2), 0] - aug_current_state[:, 0]),
-            ),
-            torch.norm(aug_current_state[:, 4:6], dim=-1),
-            torch.norm(aug_current_state[:, 6:8], dim=-1),
-            aug_current_state[:, 9],
+        # theta0 is the heading of the (perturbed) current state, not the chord
+        # to a point 1 s ahead. v0/a0 are signed tangential components: torch.norm
+        # dropped braking sign and double-counted centripetal v*omega (already in
+        # the quintic via -v0*sin(theta0)*omega0).
+        x0 = aug_current_state[:, 0]
+        y0 = aug_current_state[:, 1]
+        theta0 = heading_from_cos_sin(aug_current_state[:, 2], aug_current_state[:, 3])
+        omega0 = aug_current_state[:, 9]
+        v0, a0 = tangential_va(
+            aug_current_state[:, 4:6], aug_current_state[:, 6:8], theta0
         )
 
-        xT, yT, thetaT, vT, aT, omegaT = (
-            ego_future[:, P, 0],
-            ego_future[:, P, 1],
-            ego_future[:, P, 2],
-            torch.norm(ego_future[:, P, :2] - ego_future[:, P - 1, :2], dim=-1) / dt,
-            torch.norm(
-                ego_future[:, P, :2] - 2 * ego_future[:, P - 1, :2] + ego_future[:, P - 2, :2],
-                dim=-1,
-            )
-            / dt**2,
-            self.normalize_angle(ego_future[:, P, 2] - ego_future[:, P - 1, 2]) / dt,
-        )
+        xT = ego_future[:, P, 0]
+        yT = ego_future[:, P, 1]
+        thetaT = ego_future[:, P, 2]
+        omegaT = self.normalize_angle(ego_future[:, P, 2] - ego_future[:, P - 1, 2]) / dt
+        d1 = (ego_future[:, P, :2] - ego_future[:, P - 1, :2]) / dt
+        d2 = (
+            ego_future[:, P, :2] - 2 * ego_future[:, P - 1, :2] + ego_future[:, P - 2, :2]
+        ) / dt**2
+        vT = project_onto_heading(d1, thetaT)
+        aT = project_onto_heading(d2, thetaT)
 
         # Boundary conditions
         sx = torch.stack(
@@ -721,14 +823,34 @@ class StatePerturbationAtTau(StatePerturbation):
         ``ego_past[-1].xy == ego_current.xy`` even when that position is not the origin.
         The matching velocity/acceleration scale is consumed by the tau bridge as a
         boundary condition rather than being applied after the future was constructed.
+
+        All-zero 4D rows are padding (same contract as ``centric_transform``) and
+        are restored after the scale so they are not rotated as real history.
+        ``[0, 0, 1, 0]`` is *not* padding: that is an ego-centric origin pose
+        after ``heading_to_cos_sin``.
         """
         if not bool(aug_flag.any().item()):
             return
+
+        pad_mask = None
+        if ego_past.shape[-1] >= 4:
+            pad_mask = torch.zeros(
+                ego_past.shape[0],
+                ego_past.shape[1],
+                dtype=torch.bool,
+                device=ego_past.device,
+            )
+            pad_mask[aug_flag] = (
+                torch.sum(torch.ne(ego_past[aug_flag, :, :4], 0), dim=-1) == 0
+            )
 
         scale_xy = scale_by_batch[aug_flag].reshape(-1, 1, 1)
         center_xy = ego_current[aug_flag, :2].unsqueeze(1)
         past_xy = ego_past[aug_flag, :, :2]
         ego_past[aug_flag, :, :2] = center_xy + (past_xy - center_xy) * scale_xy
+
+        if pad_mask is not None:
+            ego_past[pad_mask] = 0
 
         scale_state = scale_by_batch[aug_flag].reshape(-1, 1)
         ego_current[aug_flag, 4:8] *= scale_state
@@ -848,11 +970,24 @@ class StatePerturbationAtTau(StatePerturbation):
         if tau_idx - left_idx < 2 or right_idx - tau_idx < 2:
             return False
 
-        # GT kinematics along the original polyline.
+        # GT kinematics along the original polyline (yaw-rate). Speed/accel at the
+        # quintic ends are signed projections onto heading, not vector magnitudes.
+        # t=0 prefers the measured current state (after history scale) so it wins
+        # when tau snaps to the current index.
         speed, accel, yaw_rate = self._estimate_kinematics(full_xy, full_heading, dt)
-        # Prefer measured current-state kinematics at t=0 when available.
-        speed[current_index] = torch.linalg.norm(ego_current[b, 4:6])
-        accel[current_index] = torch.linalg.norm(ego_current[b, 6:8])
+        speed[left_idx], accel[left_idx] = polyline_tangential_va(
+            full_xy, full_heading, left_idx, dt
+        )
+        speed[right_idx], accel[right_idx] = polyline_tangential_va(
+            full_xy, full_heading, right_idx, dt
+        )
+        speed[tau_idx], accel[tau_idx] = polyline_tangential_va(
+            full_xy, full_heading, tau_idx, dt
+        )
+        heading0 = heading_from_cos_sin(ego_current[b, 2], ego_current[b, 3])
+        speed[current_index], accel[current_index] = tangential_va(
+            ego_current[b, 4:6], ego_current[b, 6:8], heading0
+        )
         yaw_rate[current_index] = ego_current[b, 9]
 
         # Same lateral / heading / speed / accel ranges as StatePerturbation._low/_high.
@@ -1014,15 +1149,15 @@ class StatePerturbationAtTau(StatePerturbation):
         """Concatenate past|future; force last past row = current pose."""
         past_xy = ego_past_b[:, :2].clone()
         if ego_past_b.shape[-1] >= 4:
-            past_heading = torch.atan2(ego_past_b[:, 3], ego_past_b[:, 2]).clone()
+            past_heading = heading_from_cos_sin(ego_past_b[:, 2], ego_past_b[:, 3]).clone()
         else:
             past_heading = ego_past_b[:, 2].clone()
         past_xy[-1] = ego_current_b[:2]
-        past_heading[-1] = torch.atan2(ego_current_b[3], ego_current_b[2])
+        past_heading[-1] = heading_from_cos_sin(ego_current_b[2], ego_current_b[3])
 
         future_xy = ego_future_b[:, :2].clone()
         if ego_future_b.shape[-1] >= 4:
-            future_heading = torch.atan2(ego_future_b[:, 3], ego_future_b[:, 2]).clone()
+            future_heading = heading_from_cos_sin(ego_future_b[:, 2], ego_future_b[:, 3]).clone()
         else:
             future_heading = ego_future_b[:, 2].clone()
 
