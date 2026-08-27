@@ -134,7 +134,10 @@ def _fit_base_spline(
 
 
 def _diff_last_axis(x: np.ndarray, dt: float) -> np.ndarray:
-    """Forward difference along the last axis, first sample copied from the first step."""
+    """Forward difference along the last axis, first sample copied from the first step.
+
+    ``dt`` must be the constant sample spacing of a uniform time grid.
+    """
     d = np.diff(x, axis=-1) / dt
     return np.concatenate([d[..., :1], d], axis=-1)
 
@@ -297,14 +300,12 @@ def _current_state_from_kinematics(
 
     When speed is below ``v_stop``, ``heading`` (if given) is kept so the current
     pose stays aligned with the rewritten history / future rather than flipping
-    to an arbitrary ``atan2`` of a near-zero velocity.
+    to an arbitrary ``atan2`` of a near-zero velocity. The threshold matches
+    ``_headings_from_velocity`` so both sides of the t=0 join freeze together.
     """
     speed = float(np.linalg.norm(vel0))
-    if speed > 1e-6:
-        heading = float(np.arctan2(vel0[1], vel0[0]))
-    elif heading is None:
-        heading = 0.0
     if speed >= v_stop:
+        heading = float(np.arctan2(vel0[1], vel0[0]))
         steering = float(
             np.clip(
                 np.arctan(omega0 * wheel_base / abs(speed)),
@@ -313,6 +314,8 @@ def _current_state_from_kinematics(
             )
         )
     else:
+        if heading is None:
+            heading = float(np.arctan2(vel0[1], vel0[0])) if speed > 1e-6 else 0.0
         steering = 0.0
         omega0 = 0.0
     return torch.tensor(
@@ -339,11 +342,20 @@ def _ego_past_pad_mask(ego_past_4d: np.ndarray) -> np.ndarray:
 
 
 def _dense_times_with_zero(t_hist: float, t_end: float, dense_dt: float) -> np.ndarray:
-    """Uniform dense grid that always includes t=0 exactly."""
-    times = np.arange(t_hist, t_end + 0.5 * dense_dt, dense_dt, dtype=np.float64)
-    if not np.any(np.isclose(times, 0.0, atol=1e-12)):
-        times = np.sort(np.concatenate([times, np.asarray([0.0], dtype=np.float64)]))
-    return times
+    """Uniform dense grid anchored at t=0 with constant spacing ``dense_dt``.
+
+    Samples are ``k * dense_dt`` for integer ``k``, covering ``[t_hist, t_end]``
+    (endpoints may extend by less than one step). This keeps ``t=0`` exact and
+    preserves the constant-``dt`` contract used by ``_diff_last_axis`` / κ̇, ω̇
+    checks — unlike splicing 0 into a misaligned ``arange``.
+    """
+    if dense_dt <= 0.0:
+        raise ValueError("dense_dt must be positive.")
+    i0 = int(np.floor(t_hist / dense_dt + 1e-12))
+    i1 = int(np.ceil(t_end / dense_dt - 1e-12))
+    i0 = min(i0, 0)
+    i1 = max(i1, 0)
+    return np.arange(i0, i1 + 1, dtype=np.float64) * dense_dt
 
 
 class TauOffsetBump:

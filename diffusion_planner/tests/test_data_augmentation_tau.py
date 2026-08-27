@@ -315,6 +315,21 @@ def test_dense_grid_always_contains_zero() -> None:
 
     times = _dense_times_with_zero(-3.0, 8.0, 0.07)
     assert np.any(np.isclose(times, 0.0))
+    dts = np.diff(times)
+    assert np.allclose(dts, dts[0], atol=1e-12)
+    assert float(dts[0]) == pytest.approx(0.07, abs=1e-12)
+    assert times[0] <= -3.0 + 1e-12
+    assert times[-1] >= 8.0 - 1e-12
+
+
+def test_dense_grid_uniform_when_dt_misaligned() -> None:
+    """Inserting 0 into a misaligned arange must not create unequal spacings."""
+    from diffusion_planner.utils.data_augmentation_tau import _dense_times_with_zero
+
+    # t_hist not divisible by dense_dt (old splice path created short intervals at 0).
+    times = _dense_times_with_zero(-3.0, 8.0, 0.07)
+    assert np.any(np.isclose(times, 0.0))
+    assert np.allclose(np.diff(times), 0.07, atol=1e-12)
 
 
 def test_heading_continuous_across_bump_boundary() -> None:
@@ -348,6 +363,27 @@ def test_stopped_current_keeps_trajectory_heading() -> None:
         v_stop=0.2,
     )
     assert float(torch.atan2(state[3], state[2]).item()) == pytest.approx(0.7, abs=1e-5)
+
+
+def test_sub_v_stop_current_keeps_supplied_heading() -> None:
+    """1e-6 < ||v|| < v_stop must not overwrite the frozen trajectory heading."""
+    from diffusion_planner.utils.data_augmentation_tau import _current_state_from_kinematics
+
+    # Small velocity pointing along +y; supplied heading is along +x.
+    state = _current_state_from_kinematics(
+        np.array([0.0, 0.0]),
+        np.array([0.0, 0.05]),
+        np.array([0.0, 0.0]),
+        omega0=0.1,
+        wheel_base=2.75,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        heading=0.0,
+        v_stop=0.2,
+    )
+    assert float(torch.atan2(state[3], state[2]).item()) == pytest.approx(0.0, abs=1e-5)
+    assert float(state[8].item()) == pytest.approx(0.0, abs=1e-5)  # steering cleared
+    assert float(state[9].item()) == pytest.approx(0.0, abs=1e-5)  # omega cleared
 
 
 def test_smoothing_flag_forwarded() -> None:
