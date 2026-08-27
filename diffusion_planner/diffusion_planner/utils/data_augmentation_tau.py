@@ -302,10 +302,21 @@ def _current_state_from_kinematics(
     pose stays aligned with the rewritten history / future rather than flipping
     to an arbitrary ``atan2`` of a near-zero velocity. The threshold matches
     ``_headings_from_velocity`` so both sides of the t=0 join freeze together.
+
+    Reverse motion (``|vx|`` gate accepts it) keeps the supplied vehicle heading
+    when velocity is anti-aligned with that heading: ``atan2(vel)`` differs by
+    about ``π`` from body orientation, matching the trajectory freeze rule.
     """
     speed = float(np.linalg.norm(vel0))
     if speed >= v_stop:
-        heading = float(np.arctan2(vel0[1], vel0[0]))
+        vel_heading = float(np.arctan2(vel0[1], vel0[0]))
+        if heading is None:
+            heading = vel_heading
+        else:
+            step = (vel_heading - heading + np.pi) % (2.0 * np.pi) - np.pi
+            if abs(step) <= 0.5 * np.pi:
+                heading = vel_heading
+            # else: reverse / large disagreement — keep supplied vehicle heading
         steering = float(
             np.clip(
                 np.arctan(omega0 * wheel_base / abs(speed)),
@@ -782,12 +793,21 @@ class TauOffsetBump:
 
         orig_heading = self._recorded_headings(ego_past, ego_future, batch_index)
         knot_vel = _vel_at_times(dense_times, aug_vel_dense, io_times)
+        # Seed from the earliest real (non-padding) history heading. Padding rows
+        # are atan2(0,0)==0 and would otherwise freeze a wrong orientation into
+        # subsequent stopped real samples before pad restore.
+        if past_pad_mask is not None and past_pad_mask.shape[0] >= past_len:
+            real_past = np.flatnonzero(~past_pad_mask[:past_len])
+            seed_idx = int(real_past[0]) if real_past.size else 0
+        else:
+            seed_idx = 0
+        seed_heading = float(orig_heading[seed_idx])
         # Derivative-based headings everywhere so bump boundaries stay continuous;
-        # freeze uses the earliest recorded heading as the dwell seed.
+        # freeze uses the earliest non-padding recorded heading as the dwell seed.
         headings_io = _headings_from_velocity(
             knot_vel,
             v_stop=self._limits.v_stop,
-            seed_heading=float(orig_heading[0]),
+            seed_heading=seed_heading,
         )
 
         dev = ego_past.device

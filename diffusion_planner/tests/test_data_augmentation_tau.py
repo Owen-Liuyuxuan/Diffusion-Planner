@@ -386,6 +386,58 @@ def test_sub_v_stop_current_keeps_supplied_heading() -> None:
     assert float(state[9].item()) == pytest.approx(0.0, abs=1e-5)  # omega cleared
 
 
+def test_reverse_motion_keeps_supplied_heading() -> None:
+    """Velocity anti-aligned with vehicle heading must not flip current orientation."""
+    from diffusion_planner.utils.data_augmentation_tau import _current_state_from_kinematics
+
+    # Body faces +x (heading 0); reverse velocity along -x (atan2 = π).
+    state = _current_state_from_kinematics(
+        np.array([0.0, 0.0]),
+        np.array([-3.0, 0.0]),
+        np.array([0.0, 0.0]),
+        omega0=0.0,
+        wheel_base=2.75,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        heading=0.0,
+        v_stop=0.2,
+    )
+    assert float(torch.atan2(state[3], state[2]).item()) == pytest.approx(0.0, abs=1e-5)
+    assert float(state[4].item()) == pytest.approx(-3.0, abs=1e-5)
+
+
+def test_heading_seed_skips_leading_padding() -> None:
+    """Leading all-zero pads must not seed a zero heading into stopped real rows."""
+    from diffusion_planner.utils.data_augmentation_tau import (
+        _ego_past_pad_mask,
+        _headings_from_velocity,
+    )
+
+    # Production seed path: first non-padding recorded heading, not atan2(0,0).
+    past = np.zeros((8, 4), dtype=np.float64)
+    past[3:6, 0] = 1.0
+    past[3:6, 2] = np.cos(0.7)
+    past[3:6, 3] = np.sin(0.7)
+    past[6:, 0] = np.arange(2) + 2.0
+    past[6:, 2] = np.cos(0.7)
+    past[6:, 3] = np.sin(0.7)
+    pad_mask = _ego_past_pad_mask(past)
+    assert pad_mask[:3].all()
+    real = np.flatnonzero(~pad_mask)
+    seed_idx = int(real[0])
+    assert seed_idx == 3
+    seed = float(np.arctan2(past[seed_idx, 3], past[seed_idx, 2]))
+    assert seed == pytest.approx(0.7, abs=1e-6)
+
+    # Stopped velocities freeze the non-pad seed instead of pad's atan2(0,0)==0.
+    vel = np.zeros((8, 2), dtype=np.float64)
+    headings = _headings_from_velocity(vel, v_stop=0.2, seed_heading=seed)
+    assert np.allclose(headings, seed, atol=1e-6)
+    # Contrast: seeding from pad index 0 would corrupt the freeze chain.
+    bad = _headings_from_velocity(vel, v_stop=0.2, seed_heading=0.0)
+    assert np.allclose(bad, 0.0, atol=1e-6)
+
+
 def test_smoothing_flag_forwarded() -> None:
     aug = _make_tau_augmentor(use_smoothing_future_trajectory=True)
     assert aug._use_smoothing_future_trajectory is True
