@@ -170,14 +170,8 @@ def _ok_kinematics(
     kappa_rate_base = _diff_last_axis(kin_base["kappa"], dt)
     omega_rate = _diff_last_axis(kin["omega"], dt)
     omega_rate_base = _diff_last_axis(kin_base["omega"], dt)
-    ok = ok & (
-        ~moving_step
-        | (np.abs(kappa_rate - kappa_rate_base) <= limits.kappa_rate_max)
-    )
-    ok = ok & (
-        ~moving_step
-        | (np.abs(omega_rate - omega_rate_base) <= limits.omega_rate_max)
-    )
+    ok = ok & (~moving_step | (np.abs(kappa_rate - kappa_rate_base) <= limits.kappa_rate_max))
+    ok = ok & (~moving_step | (np.abs(omega_rate - omega_rate_base) <= limits.omega_rate_max))
     base_speed = np.linalg.norm(base_vel, axis=-1)
     forward = vel[..., 0] * base_vel[..., 0] + vel[..., 1] * base_vel[..., 1]
     stopped = base_speed < limits.v_stop
@@ -249,9 +243,7 @@ def _pick_merge_with_slack(
     return float(merge_candidates[int(np.random.choice(pool))])
 
 
-def _vel_at_times(
-    dense_t: np.ndarray, dense_vel: np.ndarray, times: np.ndarray
-) -> np.ndarray:
+def _vel_at_times(dense_t: np.ndarray, dense_vel: np.ndarray, times: np.ndarray) -> np.ndarray:
     """Linear sample of a dense (N, 2) velocity series at ``times``."""
     return np.stack(
         [
@@ -272,13 +264,19 @@ def _headings_from_velocity(
 
     A natural cubic on a dwell (repeated poses) can reverse the interpolant
     velocity; freezing avoids a π heading flip that is not in the recorded data.
+    Large single-step heading jumps (>\u03c0/2) are also frozen: they are not
+    reachable under the comfort ω limit on the 0.1 s I/O grid and almost always
+    mean a cubic dwell reversal rather than a real turn.
     """
     speed = np.linalg.norm(vel, axis=-1)
     headings = np.arctan2(vel[:, 1], vel[:, 0])
-    if seed_heading is not None and speed[0] < v_stop:
+    if seed_heading is not None:
+        # Prefer the recorded start even when the first sample is moving; the
+        # bump then rotates continuously from that seed via unwrap.
         headings[0] = seed_heading
     for i in range(1, headings.shape[0]):
-        if speed[i] < v_stop:
+        step = (headings[i] - headings[i - 1] + np.pi) % (2.0 * np.pi) - np.pi
+        if speed[i] < v_stop or abs(step) > 0.5 * np.pi:
             headings[i] = headings[i - 1]
     return np.unwrap(headings)
 
@@ -291,10 +289,22 @@ def _current_state_from_kinematics(
     wheel_base: float,
     dtype: torch.dtype,
     device: torch.device,
+    *,
+    heading: float | None = None,
+    v_stop: float = 0.2,
 ) -> torch.Tensor:
+    """Build ``ego_current_state`` from XY kinematics.
+
+    When speed is below ``v_stop``, ``heading`` (if given) is kept so the current
+    pose stays aligned with the rewritten history / future rather than flipping
+    to an arbitrary ``atan2`` of a near-zero velocity.
+    """
     speed = float(np.linalg.norm(vel0))
-    heading = float(np.arctan2(vel0[1], vel0[0]) if speed > 1e-6 else 0.0)
-    if speed >= 0.2:
+    if speed > 1e-6:
+        heading = float(np.arctan2(vel0[1], vel0[0]))
+    elif heading is None:
+        heading = 0.0
+    if speed >= v_stop:
         steering = float(
             np.clip(
                 np.arctan(omega0 * wheel_base / abs(speed)),
@@ -323,6 +333,19 @@ def _current_state_from_kinematics(
     )
 
 
+def _ego_past_pad_mask(ego_past_4d: np.ndarray) -> np.ndarray:
+    """True where a history row is all-zero 4D padding (centric_transform contract)."""
+    return np.sum(ego_past_4d[..., :4] != 0.0, axis=-1) == 0
+
+
+def _dense_times_with_zero(t_hist: float, t_end: float, dense_dt: float) -> np.ndarray:
+    """Uniform dense grid that always includes t=0 exactly."""
+    times = np.arange(t_hist, t_end + 0.5 * dense_dt, dense_dt, dtype=np.float64)
+    if not np.any(np.isclose(times, 0.0, atol=1e-12)):
+        times = np.sort(np.concatenate([times, np.asarray([0.0], dtype=np.float64)]))
+    return times
+
+
 class TauOffsetBump:
     """``p̃ = p + w(t) b``: one C² interpolant from ``t_b - lead`` to ``T``."""
 
@@ -334,8 +357,10 @@ class TauOffsetBump:
     def __init__(
         self,
         augment_prob: float,
+        num_refine: int,
         device: torch.device | str,
-        use_smoothing_future_trajectory: bool,
+        ego_past_noise_std: float = 0.0,
+        use_smoothing_future_trajectory: bool = False,
         tau_min_s: float = -1.0,
         tau_max_s: float = 0.0,
         tau_lon_m: float = 0.4,
@@ -345,10 +370,13 @@ class TauOffsetBump:
         history_lead_s: float = 2.0,
         min_future_merge_s: float = 0.5,
         kinematic_limits: KinematicLimits | None = None,
-        *,
-        num_refine: int = 20,
-        ego_past_noise_std: float = 0.0,
     ) -> None:
+        """Match legacy ``StatePerturbationAtTau`` positional prefix for callers.
+
+        Positional order is ``(augment_prob, num_refine, device, ego_past_noise_std,
+        use_smoothing_future_trajectory, ...)`` so existing train wiring and the
+        ``StatePerturbationAtTau`` alias keep working.
+        """
         if tau_min_s > tau_max_s:
             raise ValueError("tau_min_s must be <= tau_max_s.")
         if history_lead_s <= 0.0:
@@ -358,8 +386,10 @@ class TauOffsetBump:
                 f"tau_max_s={tau_max_s} must be before min_future_merge_s={min_future_merge_s}."
             )
         self._augment_prob = float(augment_prob)
+        self._num_refine = int(num_refine)
         self._device = torch.device(device)
-        self._use_smoothing_future_trajectory = use_smoothing_future_trajectory
+        self._ego_past_noise_std = float(ego_past_noise_std)
+        self._use_smoothing_future_trajectory = bool(use_smoothing_future_trajectory)
         self._tau_min_s = float(tau_min_s)
         self._tau_max_s = float(tau_max_s)
         self._tau_lon_m = float(tau_lon_m)
@@ -368,7 +398,6 @@ class TauOffsetBump:
         self._tau_merge_slack_s = float(tau_merge_slack_s)
         self._history_lead_s = float(history_lead_s)
         self._min_future_merge_s = float(min_future_merge_s)
-        self._num_refine = int(num_refine)
         self._limits = kinematic_limits or KinematicLimits()
         self.time_interval = TIME_INTERVAL
         self.last_bump_info: dict | None = None
@@ -399,12 +428,8 @@ class TauOffsetBump:
             raise ValueError(f"t_b={t_b} must be after the first history time {t_hist}.")
         history_merge_s = max(t_hist, t_b - self._history_lead_s)
         if history_merge_s >= t_b:
-            raise ValueError(
-                f"history merge {history_merge_s} must be before t_b={t_b}."
-            )
-        merge_cands = np.arange(
-            self._min_future_merge_s, t_max + 0.5 * dt, dt
-        )
+            raise ValueError(f"history merge {history_merge_s} must be before t_b={t_b}.")
+        merge_cands = np.arange(self._min_future_merge_s, t_max + 0.5 * dt, dt)
         merge_cands = merge_cands[merge_cands > t_b]
         if merge_cands.size == 0:
             return None
@@ -422,9 +447,7 @@ class TauOffsetBump:
         if not np.any(valid):
             return None
         t_star = float(merge_cands[np.flatnonzero(valid)[0]])
-        t_merge = _pick_merge_with_slack(
-            merge_cands, valid, self._tau_merge_slack_s
-        )
+        t_merge = _pick_merge_with_slack(merge_cands, valid, self._tau_merge_slack_s)
         if t_merge is None:
             return None
         return history_merge_s, float(t_merge), t_star
@@ -444,7 +467,7 @@ class TauOffsetBump:
             inputs,
             ego_future,
             neighbors_future,
-            use_smoothing_future_trajectory=False,
+            use_smoothing_future_trajectory=self._use_smoothing_future_trajectory,
             transform_ego_past=True,
         )
 
@@ -456,6 +479,7 @@ class TauOffsetBump:
         ego_past = inputs["ego_agent_past"].clone()
         aug_future = ego_future.clone()
         device = ego_current.device
+        dtype = ego_current.dtype
         B = ego_current.shape[0]
         past_len = ego_past.shape[1]
         self.last_bump_info = None
@@ -471,9 +495,21 @@ class TauOffsetBump:
                 f"prob_roll={bool(aug_flag[0].item())}"
             )
             if not bool(valid_speed[0].item()):
-                self.last_debug_fail = (
-                    f"speed_gate vx={vx:.3f} < {self.min_speed_mps} m/s"
-                )
+                self.last_debug_fail = f"speed_gate vx={vx:.3f} < {self.min_speed_mps} m/s"
+
+        # Legacy history-speed scale about the current pose, before the bump.
+        history_scale = torch.ones(B, device=device, dtype=dtype)
+        n_aug = int(aug_flag.sum().item())
+        if n_aug > 0 and self._ego_past_noise_std > 0.0:
+            W = self._ego_past_noise_std
+            sampled = torch.normal(mean=1.0, std=W, size=(n_aug,), device=device).to(dtype=dtype)
+            history_scale[aug_flag] = torch.clamp(sampled, 1.0 - 2 * W, 1.0 + 2 * W)
+            self._scale_history_about_current(
+                ego_current=ego_current,
+                ego_past=ego_past,
+                aug_flag=aug_flag,
+                scale_by_batch=history_scale,
+            )
 
         for batch_index in torch.nonzero(aug_flag, as_tuple=False).flatten():
             b = int(batch_index.item())
@@ -486,7 +522,7 @@ class TauOffsetBump:
                     batch_index=b,
                     past_len=past_len,
                 )
-            except RuntimeError as exc:
+            except (RuntimeError, ValueError) as exc:
                 ok = False
                 self.last_debug_fail = f"exception: {exc}"
                 self._log_debug(f"b={b} {self.last_debug_fail}")
@@ -505,13 +541,42 @@ class TauOffsetBump:
             self.last_tau_info = dict(self.last_bump_info)
         return aug_flag, ego_current, ego_past, aug_future
 
+    @staticmethod
+    def _scale_history_about_current(
+        ego_current: torch.Tensor,
+        ego_past: torch.Tensor,
+        aug_flag: torch.Tensor,
+        scale_by_batch: torch.Tensor,
+    ) -> None:
+        """Dilate accepted histories about current pose; restore all-zero 4D pads."""
+        if not bool(aug_flag.any().item()):
+            return
+        pad_mask = None
+        if ego_past.shape[-1] >= 4:
+            pad_mask = torch.zeros(
+                ego_past.shape[0],
+                ego_past.shape[1],
+                dtype=torch.bool,
+                device=ego_past.device,
+            )
+            pad_mask[aug_flag] = torch.sum(torch.ne(ego_past[aug_flag, :, :4], 0), dim=-1) == 0
+        scale_xy = scale_by_batch[aug_flag].reshape(-1, 1, 1)
+        center_xy = ego_current[aug_flag, :2].unsqueeze(1)
+        past_xy = ego_past[aug_flag, :, :2]
+        ego_past[aug_flag, :, :2] = center_xy + (past_xy - center_xy) * scale_xy
+        if pad_mask is not None:
+            ego_past[pad_mask] = 0
+        scale_state = scale_by_batch[aug_flag].reshape(-1, 1)
+        ego_current[aug_flag, 4:8] *= scale_state
+
     def _check_aug_validity(self, aug_ego_state: torch.Tensor, inputs: dict) -> torch.Tensor:
         return check_aug_validity(aug_ego_state, inputs)
 
     def get_transform_matrix_batch(self, cur_state: torch.Tensor) -> torch.Tensor:
         return get_transform_matrix_batch(cur_state)
 
-    def _sample_bias_and_peak(self) -> tuple[np.ndarray, float]:
+    def _sample_bias_and_peak(self, t_hist: float) -> tuple[np.ndarray, float] | None:
+        """Sample ``(b, t_b)`` with ``t_b`` strictly after the first real history time."""
         bias = np.array(
             [
                 np.random.uniform(-self._tau_lon_m, self._tau_lon_m),
@@ -519,7 +584,12 @@ class TauOffsetBump:
             ],
             dtype=np.float64,
         )
-        t_b = float(np.random.uniform(self._tau_min_s, self._tau_max_s))
+        # Keep a small gap so history_merge = max(t_hist, t_b - lead) stays < t_b.
+        lo = max(self._tau_min_s, t_hist + self._tau_dense_dt)
+        hi = self._tau_max_s
+        if lo > hi:
+            return None
+        t_b = float(np.random.uniform(lo, hi))
         return bias, t_b
 
     def _augment_single(
@@ -535,26 +605,40 @@ class TauOffsetBump:
         dense_dt = self._tau_dense_dt
         np.random.seed(int(torch.randint(0, 2**31 - 1, ()).item()))
 
-        past_xy = ego_past[batch_index, :, :2].cpu().numpy().astype(np.float64)
+        past_4d = ego_past[batch_index, :, :4].detach().cpu().numpy().astype(np.float64)
+        pad_mask = _ego_past_pad_mask(past_4d)
+        past_xy = past_4d[:, :2].copy()
         future_xy = ego_future[batch_index, :, :2].cpu().numpy().astype(np.float64)
         current_xy = ego_current[batch_index, :2].cpu().numpy()
         past_xy[-1] = current_xy
+        # Current pose is never padding; keep the last knot even if the row was zero.
+        pad_mask = pad_mask.copy()
+        pad_mask[-1] = False
+        valid_past = ~pad_mask
+        if not np.any(valid_past):
+            self.last_debug_fail = "no_valid_history_knots"
+            return False
 
-        knot_xy = np.concatenate([past_xy, future_xy], axis=0)
-        past_times = (np.arange(past_len) - (past_len - 1)) * dt
+        past_times_all = (np.arange(past_len) - (past_len - 1)) * dt
         future_times = (np.arange(1, ego_future.shape[1] + 1)) * dt
-        knot_times = np.concatenate([past_times, future_times])
+        knot_xy = np.concatenate([past_xy[valid_past], future_xy], axis=0)
+        knot_times = np.concatenate([past_times_all[valid_past], future_times])
         t_hist = float(knot_times[0])
         t_end = float(knot_times[-1])
         t_max = self._merge_search_max(t_end)
 
-        dense_times = np.arange(t_hist, t_end + 0.5 * dense_dt, dense_dt)
-        base_pos, base_vel, base_acc, base_jerk = _fit_base_spline(
-            knot_times, knot_xy, dense_times
-        )
+        dense_times = _dense_times_with_zero(t_hist, t_end, dense_dt)
+        base_pos, base_vel, base_acc, base_jerk = _fit_base_spline(knot_times, knot_xy, dense_times)
 
         for sample_attempt in range(self.bias_sample_attempts):
-            bias, t_b = self._sample_bias_and_peak()
+            sampled = self._sample_bias_and_peak(t_hist)
+            if sampled is None:
+                self.last_debug_fail = (
+                    f"sample_attempt={sample_attempt} empty_peak_range "
+                    f"t_hist={t_hist:.3f} tau=[{self._tau_min_s}, {self._tau_max_s}]"
+                )
+                continue
+            bias, t_b = sampled
             if float(np.linalg.norm(bias)) < self.min_bias_norm:
                 self.last_debug_fail = (
                     f"sample_attempt={sample_attempt} bias_norm_below_min "
@@ -590,7 +674,9 @@ class TauOffsetBump:
                 continue
 
             history_merge_s, t_merge, t_star = found
-            io_times = np.concatenate([past_times, future_times])
+            io_times = np.concatenate([past_times_all, future_times])
+            # Dense spline omitted pads; rebuild full-length knot XY for I/O rewrite.
+            knot_xy_io = np.concatenate([past_xy, future_xy], axis=0)
             self._write_bump_io(
                 ego_current=ego_current,
                 ego_past=ego_past,
@@ -598,7 +684,7 @@ class TauOffsetBump:
                 batch_index=batch_index,
                 past_len=past_len,
                 wheel_base=wheel_base,
-                knot_xy=knot_xy,
+                knot_xy=knot_xy_io,
                 io_times=io_times,
                 dense_times=dense_times,
                 base_pos=base_pos,
@@ -610,6 +696,7 @@ class TauOffsetBump:
                 t_merge=t_merge,
                 t_star=t_star,
                 t_max=t_max,
+                past_pad_mask=pad_mask,
             )
             return True
 
@@ -655,11 +742,10 @@ class TauOffsetBump:
         t_merge: float,
         t_star: float,
         t_max: float,
+        past_pad_mask: np.ndarray | None = None,
     ) -> None:
         """Resample offset XY / heading onto 0.1 s I/O and rewrite current state."""
-        w_io, _, _, _ = _offset_weight_derivs(
-            io_times, history_merge_s, t_b, t_merge
-        )
+        w_io, _, _, _ = _offset_weight_derivs(io_times, history_merge_s, t_b, t_merge)
         aug_xy = knot_xy + w_io[:, None] * bias
         w_dense, dw_dense, ddw_dense, _ = _offset_weight_derivs(
             dense_times, history_merge_s, t_b, t_merge
@@ -668,7 +754,9 @@ class TauOffsetBump:
         aug_acc_dense = base_acc + ddw_dense[:, None] * bias
         aug_pos_dense = base_pos + w_dense[:, None] * bias
 
-        idx0 = int(np.argmin(np.abs(dense_times)))
+        # Evaluate current-state kinematics at exact t=0 (grid always contains 0).
+        zero_hits = np.flatnonzero(np.isclose(dense_times, 0.0, atol=1e-12))
+        idx0 = int(zero_hits[0]) if zero_hits.size else int(np.argmin(np.abs(dense_times)))
         pos0 = aug_pos_dense[idx0]
         vel0 = aug_vel_dense[idx0]
         acc0 = aug_acc_dense[idx0]
@@ -682,13 +770,13 @@ class TauOffsetBump:
 
         orig_heading = self._recorded_headings(ego_past, ego_future, batch_index)
         knot_vel = _vel_at_times(dense_times, aug_vel_dense, io_times)
+        # Derivative-based headings everywhere so bump boundaries stay continuous;
+        # freeze uses the earliest recorded heading as the dwell seed.
         headings_io = _headings_from_velocity(
             knot_vel,
             v_stop=self._limits.v_stop,
             seed_heading=float(orig_heading[0]),
         )
-        keep_orig = np.abs(w_io) <= 1e-8
-        headings_io = np.unwrap(np.where(keep_orig, orig_heading, headings_io))
 
         dev = ego_past.device
         dtyp = ego_past.dtype
@@ -704,6 +792,8 @@ class TauOffsetBump:
         ego_past[batch_index, :, 3] = torch.sin(
             torch.from_numpy(headings_io[:past_len]).to(device=dev, dtype=dtyp)
         )
+        if past_pad_mask is not None and np.any(past_pad_mask):
+            ego_past[batch_index, past_pad_mask] = 0
         ego_future[batch_index, :, 0] = torch.from_numpy(aug_xy[past_len:, 0]).to(
             device=dev, dtype=dtyp
         )
@@ -713,6 +803,7 @@ class TauOffsetBump:
         ego_future[batch_index, :, 2] = torch.from_numpy(headings_io[past_len:]).to(
             device=dev, dtype=dtyp
         )
+        heading0 = float(headings_io[past_len - 1])
         ego_current[batch_index] = _current_state_from_kinematics(
             pos0,
             vel0,
@@ -721,13 +812,13 @@ class TauOffsetBump:
             wheel_base,
             dtype=ego_current.dtype,
             device=ego_current.device,
+            heading=heading0,
+            v_stop=self._limits.v_stop,
         )
 
         idx_merge = int(np.argmin(np.abs(dense_times - t_merge)))
         merge_err = float(np.linalg.norm(aug_pos_dense[idx_merge] - base_pos[idx_merge]))
-        w0, dw0, _, _ = _offset_weight_derivs(
-            np.array([0.0]), history_merge_s, t_b, t_merge
-        )
+        w0, dw0, _, _ = _offset_weight_derivs(np.array([0.0]), history_merge_s, t_b, t_merge)
         self.last_bump_info = {
             "batch_index": batch_index,
             "accepted": True,
